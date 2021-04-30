@@ -27,6 +27,7 @@ use rustc_fs_util::path_to_c_string;
 use rustc_hir::def::CtorKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_index::vec::{Idx, IndexVec};
+use rustc_middle::hir;
 use rustc_middle::ich::NodeIdHashingMode;
 use rustc_middle::mir::{self, Field, GeneratorLayout};
 use rustc_middle::ty::layout::{self, IntegerExt, PrimitiveExt, TyAndLayout};
@@ -1285,6 +1286,62 @@ struct TupleMemberDescriptionFactory<'tcx> {
 
 impl<'tcx> TupleMemberDescriptionFactory<'tcx> {
     fn create_member_descriptions(&self, cx: &CodegenCx<'ll, 'tcx>) -> Vec<MemberDescription<'ll>> {
+        // For closures and generators, we mangle the upvars' names to something like:
+        //  - `_upvar__name`
+        //  - `_upvar_ref__name`
+        //  - `_upvar_ref_mut__name`
+        // The purpose is to make those names human-understandable. Otherwise, the end users may
+        // get confused when the debuggers just print some pointers for closures or generators.
+        let closure_def_id = match *self.ty.kind() {
+            ty::Generator(def_id, ..) => def_id.as_local(),
+            ty::Closure(def_id, ..) => def_id.as_local(),
+            _ => None,
+        };
+        let captures = match closure_def_id {
+            Some(local_def_id) => {
+                let typeck_results = cx.tcx.typeck(local_def_id);
+                let captures = typeck_results
+                    .closure_min_captures_flattened(local_def_id.to_def_id())
+                    .collect::<Vec<_>>();
+                Some(captures)
+            }
+            _ => None,
+        };
+        let format_name = |i| {
+            match &captures {
+                Some(ref captures) => {
+                    let capture: &ty::CapturedPlace<'tcx> = captures[i];
+
+                    let prefix = if cx.tcx.features().capture_disjoint_fields {
+                        // FIXME:
+                        // Here we may need more name mangling to reflect disjoint fields.
+                        format!("_upvar{}_", i)
+                    } else {
+                        "_upvar_".to_string()
+                    };
+
+                    let adjust = match capture.info.capture_kind {
+                        ty::UpvarCapture::ByValue(_) => "_",
+                        ty::UpvarCapture::ByRef(borrow)
+                            if borrow.kind == ty::BorrowKind::MutBorrow =>
+                        {
+                            "ref_mut__"
+                        }
+                        ty::UpvarCapture::ByRef(_) => "ref__",
+                    };
+
+                    let hir_id = match capture.place.base {
+                        hir::place::PlaceBase::Upvar(upvar_id) => upvar_id.var_path.hir_id,
+                        base => bug!("Expected an upvar, found {:?}", base),
+                    };
+                    let name = cx.tcx.hir().name(hir_id).as_str();
+
+                    prefix + adjust + &name
+                }
+                None => format!("__{}", i),
+            }
+        };
+
         let layout = cx.layout_of(self.ty);
         self.component_types
             .iter()
@@ -1292,7 +1349,7 @@ impl<'tcx> TupleMemberDescriptionFactory<'tcx> {
             .map(|(i, &component_type)| {
                 let (size, align) = cx.size_and_align_of(component_type);
                 MemberDescription {
-                    name: format!("__{}", i),
+                    name: format_name(i),
                     type_metadata: type_metadata(cx, component_type, self.span),
                     offset: layout.fields.offset(i),
                     size,
