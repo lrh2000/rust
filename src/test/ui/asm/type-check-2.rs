@@ -84,9 +84,6 @@ fn main() {
         //~^ ERROR cannot use value of type `&mut i32` for inline assembly
         let _ = (f, r);
 
-        // Type checks ignore never type
-
-        let u: ! = unreachable!();
-        asm!("{}", in(reg) u);
+        // For never type, see type-check-never.rs
     }
 }

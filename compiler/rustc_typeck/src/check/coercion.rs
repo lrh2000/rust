@@ -1022,8 +1022,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         // First try to coerce the new expression to the type of the previous ones,
         // but only if the new expression has no coercion already applied to it.
-        let mut first_error = None;
-        if !self.typeck_results.borrow().adjustments().contains_key(new.hir_id) {
+        let first_try =
+            match self.typeck_results.borrow().adjustments().get(new.hir_id).map(|v| &v[..]) {
+                Some(&[Adjustment { kind: Adjust::NeverToAny, .. }]) => true,
+                Some(&[]) | None => true,
+                _ => false,
+            };
+        let first_error = if first_try {
             let result = self.commit_if_ok(|_| coerce.coerce(new_ty, prev_ty));
             match result {
                 Ok(ok) => {
@@ -1035,9 +1040,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     );
                     return Ok(target);
                 }
-                Err(e) => first_error = Some(e),
+                Err(e) => Some(e),
             }
-        }
+        } else {
+            None
+        };
 
         // Then try to coerce the previous expressions to the type of the new one.
         // This requires ensuring there are no coercions applied to *any* of the
